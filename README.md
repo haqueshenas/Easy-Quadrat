@@ -7,7 +7,7 @@ Easy Quadrat is nothing but the same quadrat traditionally used in agronomy and 
 **Overview**
 
 The initial step in RGB image analysis for phenotyping involves segmenting the intended canopy area from the background. Although commercial phenotyping platforms usually employ built-in segmentation algorithms, researchers may opt to supervise the image segmentation process. This can be a time-consuming task, especially when dealing with numerous experimental plots. Easy Quadrat, a Python-based freeware, addresses this challenge by providing a set of simple tools to speed up the determination, segmentation, and cropping of sampling areas in ground-based images captured from crop canopies.
-Depending on the study's goals and conditions, the segmentation task can be performed manually or automatically (the latter of which requires a white traditional quadrat to be present in the image). Even in the manual method, efforts are made to streamline and speed up the selection and segmentation processes. Easy Quadrat offers five image segmentation methods, known as Cropping methods. The three automated methods are designed to find and segment a white sampling quadrat in the image. For detailed information on each method, refer to the relevant section in the README.pdf file.
+Depending on the study's goals and conditions, the segmentation task can be performed manually or automatically (the latter of which requires a white traditional quadrat to be present in the image). Even in the manual method, efforts are made to streamline and speed up the selection and segmentation processes. Easy Quadrat offers five image segmentation methods, known as Cropping methods. The three automated methods are designed to find and segment a white sampling quadrat in the image. For detailed information on each method, refer to the relevant section in the README.pdf file (https://github.com/haqueshenas/Easy-Quadrat/blob/main/README.pdf).
 
 **Getting Started**
 
@@ -36,7 +36,6 @@ If you wish to run the Python code instead of the executable file, download both
 5. Open and run the main.py code in Python.
    
 
-For more detailed information, refer to the README.pdf file (https://github.com/haqueshenas/Easy-Quadrat/blob/main/README.pdf).
     
 -------
 
