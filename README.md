@@ -16,11 +16,27 @@ Depending on the study's goals and conditions, the segmentation task can be perf
 3.	Specify the input path (original images from the canopy) and output path (desired location for saving outputs).
 4.	Choose the cropping method.
 5.	Click the Ok button.
+
+Note: Ensure that the output path is an empty directory to prevent potential unexpected errors.
+
+
+If you wish to run the Python code instead of the executable file, download both EasyQuadrat.rar and main.py files and follow these steps:
+
+1. Make a new directory (e.g., "EasyQuadratProject") and place the main.py file there.
+2. Unpack the EasyQuadrat.rar.
+3. Navigate to the "..\EasyQuadrat\ _internal path."
+4. Copy the following files to the newly made directory ("EasyQuadratProject"):
+
+   a. EQ.ico (Application Icon)   
+   b. EQS.png (Initializing Image)  
+   c. Quadrat.png (GUI Image)  
+   d. easyquadrat.pt (Model File)  
+   e. easyquadrat2.pt (Another Model File)  
+
+5. Open and run the main.py code in Python.
    
-Note: Ensure that the output path is an empty directory.
 
-For more information, please see the README.pdf file.
-
+For more detailed information, refer to the README.pdf file (https://github.com/haqueshenas/Easy-Quadrat/blob/main/README.pdf).
     
 -------
 
