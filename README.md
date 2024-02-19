@@ -19,7 +19,7 @@ Depending on the study's goals and conditions, the segmentation task can be perf
 
 Note: Ensure that the output path is an empty directory to prevent potential unexpected errors.
 
-EQ Frameless models: If you wish to have a try to mitigate or eliminate the impact of quadrat frames, download the EQ_Frameless_1 or EQ_Frameless_2 models from the YOLOPlusModels directory and run them as custom models (as described before). These YOLOv8n-seg-type models have been trained almost using the same dataset utilized for training EQ1 and EQ2 models.
+EQ Frameless models: If you wish to have a try to mitigate or eliminate the impact of quadrat frames, download the EQ_Frameless_1 or EQ_Frameless_2 models from the YOLOPlusModels directory and run them as custom models (please see README.pdf). These YOLOv8n-seg-type models have been trained almost using the same dataset utilized for training EQ1 and EQ2 models.
 
 
 If you wish to run the Python code instead of the executable file, download both EasyQuadrat.rar and main.py files and follow these steps:
