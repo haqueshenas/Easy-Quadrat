@@ -1,1 +1,24 @@
-EasyQuadrat.rar filter=lfs diff=lfs merge=lfs -text
+# Store source and documentation text with LF line endings.
+*.py text eol=lf
+*.spec text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+LICENSE text eol=lf
+.gitattributes text eol=lf
+.gitignore text eol=lf
+
+# Store trained PyTorch model weights in Git LFS.
+*.pt filter=lfs diff=lfs merge=lfs -text
+
+# Preserve binary assets without text conversion.
+*.ico binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.bmp binary
+*.tif binary
+*.tiff binary
+*.pdf binary
+*.dll binary
+*.exe binary

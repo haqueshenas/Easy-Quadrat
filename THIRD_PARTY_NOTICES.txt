@@ -1,0 +1,78 @@
+Third-Party Software Notices
+============================
+
+1. libjpeg-turbo 3.2.0
+----------------------
+
+Bundled components:
+- vendor/libjpeg-turbo/win-x64/jpegtran.exe
+- vendor/libjpeg-turbo/win-x64/jpeg62.dll
+
+This software is based in part on the work of the Independent JPEG Group.
+
+The bundled libjpeg-turbo components are provided under their applicable
+upstream license terms. The upstream license and notice documents are
+included unmodified in:
+
+- vendor/libjpeg-turbo/LICENSE.md
+- vendor/libjpeg-turbo/README.ijg
+- vendor/libjpeg-turbo/README.md
+
+Upstream project:
+https://github.com/libjpeg-turbo/libjpeg-turbo
+
+Upstream release:
+https://github.com/libjpeg-turbo/libjpeg-turbo/releases/tag/3.2.0
+
+
+2. Ultralytics YOLO and Easy Quadrat Model Weights
+--------------------------------------------------
+
+Auto Deep Learning uses the Ultralytics YOLO instance-segmentation
+framework and trained model weights.
+
+Built-in model files:
+- models/easyquadrat.pt
+  Easy Quadrat EQ1; documented in the v1.0 release as YOLOv8n-seg.
+
+- models/easyquadrat2.pt
+  Easy Quadrat EQ2; documented in the v1.0 release as YOLOv8m-seg.
+
+- models/EQ_Frameless_1.pt
+  Easy Quadrat Frameless model variant 1.
+
+- models/EQ_Frameless_2.pt
+  Easy Quadrat Frameless model variant 2.
+
+The Easy Quadrat v1.0 source code explicitly stated that the application
+source was distributed under the MIT License and that the included
+YOLOv8n-seg and YOLOv8m-seg models were subject to AGPL-3.0.
+
+The v1.0 release README described the Frameless variants as YOLOv8n-seg-
+type models trained for the purpose of reducing the influence of quadrat
+frames. Their applicable licensing terms must be considered together with
+the relevant upstream terms and any written clarification obtained by
+the project developer.
+
+Historical source:
+https://github.com/haqueshenas/Easy-Quadrat/blob/v1.0/main.py
+
+Historical model guidance:
+https://github.com/haqueshenas/Easy-Quadrat/blob/v1.0/README.md
+
+Ultralytics segmentation documentation:
+https://docs.ultralytics.com/tasks/segment
+
+Ultralytics licensing information:
+https://www.ultralytics.com/license
+
+AGPL-3.0 license text:
+https://www.gnu.org/licenses/agpl-3.0.html
+
+The root LICENSE file applies to Easy Quadrat source code as specified
+therein. It does not, by itself, replace the applicable terms of
+third-party software or separately licensed model weights.
+
+The project developer should retain the relevant written licensing
+clarification and verify that it covers the distributed framework and
+all four model files before publishing a release.
