@@ -299,7 +299,12 @@ class AboutDialog(QDialog):
             "should be read together with the bundled "
             "THIRD_PARTY_NOTICES.txt file.<br><br>"
 
-            "<b>Ultralytics and YOLO licensing:</b> The Ultralytics "
+            "YOLO is used only in the fifth method, "
+           "<b>Auto · Deep Learning</b>. The licensing information below "
+           "concerns this method and its four bundled trained-model files "
+           "listed above.<br><br>"
+
+           "<b>Ultralytics and YOLO licensing:</b> The Ultralytics "
             "YOLOv8 framework and related trained model weights are "
             "subject to third-party licensing separate from the Easy Quadrat "
             "application source. Ultralytics identifies the <b>GNU Affero "

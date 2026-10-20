@@ -986,7 +986,9 @@ class ClassicIWorker(QThread):
             f"Closing radius: {self.closing_radius}; "
             f"Opening radius: {self.opening_radius}; "
             f"Background color: {self.background_name}; "
-            f"Output policy: {self.output_policy.value}"
+            f"Output policy: {self.output_policy.value}\n"
+            f"Input directory: {self.image_files[0].parent.resolve()}\n"
+            f"Output directory: {self.output_layout.root.resolve()}"
         )
 
         try:

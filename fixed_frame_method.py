@@ -3593,7 +3593,6 @@ class FixedFrameDialog(QDialog):
 
         self.worker_result = None
         self.root_content.setEnabled(False)
-        self.back_button.setEnabled(False)
         self.run_button.setEnabled(False)
 
         self.progress_dialog = FixedFrameProgressDialog(
@@ -3633,7 +3632,6 @@ class FixedFrameDialog(QDialog):
     @Slot()
     def _worker_finished(self) -> None:
         self.root_content.setEnabled(True)
-        self.back_button.setEnabled(True)
 
         self.worker = None
 
