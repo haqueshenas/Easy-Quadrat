@@ -2946,16 +2946,12 @@ class FixedFrameDialog(QDialog):
 
         buttons = QHBoxLayout()
 
-        self.back_button = QPushButton("Back to main menu")
-        self.back_button.clicked.connect(self.reject)
-
         self.run_button = QPushButton("Crop images")
         self.run_button.setObjectName("primaryButton")
         self.run_button.setMinimumWidth(125)
         self.run_button.setFixedHeight(34)
         self.run_button.clicked.connect(self._run_cropping)
 
-        buttons.addWidget(self.back_button)
         buttons.addStretch(1)
         buttons.addWidget(self.run_button)
 
