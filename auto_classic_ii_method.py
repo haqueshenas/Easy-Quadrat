@@ -1,17 +1,10 @@
-
 """
 Easy Quadrat v2.0.0 — Auto (Classic II) image-processing method.
 
-This implementation ports the original Auto (Classic II) sequence from
-Easy Quadrat v1.0:
-
-1. Low-saturation threshold.
-2. Isotropic opening.
-3. Isotropic closing.
-4. Largest connected background component and inversion.
-5. Directional rectangular openings in both axes.
-6. Border clearing and convex-hull construction.
-7. Selection between the two hull masks using the original decision rule.
+This implementation preserves the original Auto (Classic II) sequence:
+low-saturation threshold, isotropic opening and closing, largest background
+component and inversion, directional rectangular openings, border clearing,
+convex-hull construction, and the legacy two-candidate area-selection rule.
 
 Image encoding and output verification are delegated to core.image_output.
 
@@ -27,28 +20,31 @@ AI coding assistance: OpenAI GPT-6
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from threading import Event
 
 import numpy as np
 from PIL import Image, ImageOps
 from scipy import ndimage as ndi
-from skimage import morphology, segmentation
+from skimage import morphology
 from skimage.morphology import convex_hull_image
 
-from PySide6.QtCore import QThread, Signal, Slot
+from PySide6.QtCore import QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QDialog,
     QDoubleSpinBox,
     QFileDialog,
-    QFormLayout,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
     QVBoxLayout,
     QWidget,
@@ -67,10 +63,24 @@ from output_manager import (
     ProcessingRunLog,
     prepare_output_layout,
 )
+from ui.processing_preview import (
+    ProcessingPreviewPanel,
+    make_preview_base,
+    render_processing_preview,
+    rgb_array_to_qimage,
+)
 from ui.window_utils import configure_window
 
 
-# RGB values, not BGR. These preserve the eight legacy choices.
+# ---------------------------------------------------------------------
+# Defaults and application constants
+# ---------------------------------------------------------------------
+
+DEFAULT_SATURATION_THRESHOLD = 0.1
+DEFAULT_CLOSING_RADIUS = 40
+DEFAULT_OPENING_FACTOR = 300
+DEFAULT_BACKGROUND_NAME = "Black"
+
 BACKGROUND_RGB = {
     "Black": (0, 0, 0),
     "Blue": (0, 0, 255),
@@ -82,9 +92,9 @@ BACKGROUND_RGB = {
     "Yellow": (255, 255, 0),
 }
 
-CONNECTIVITY_8 = np.ones((3, 3), dtype=bool)
+_CONNECTIVITY_8 = np.ones((3, 3), dtype=bool)
 
-EXIF_ORIENTATIONS_THAT_TRANSFORM_PIXELS = frozenset({
+_EXIF_ORIENTATIONS_THAT_TRANSFORM_PIXELS = frozenset({
     2, 3, 4, 5, 6, 7, 8,
 })
 
@@ -97,16 +107,16 @@ def _load_rgb_image(
     path: Path,
 ) -> tuple[np.ndarray, dict, list[str]]:
     """
-    Load the primary frame as an independent 8-bit RGB array.
+    Load the first frame of an image as an independent 8-bit RGB array.
 
-    EXIF Orientation is applied before Classic II processing.
+    EXIF Orientation is applied before the Classic II algorithm.
 
     Grayscale, palette, CMYK, and alpha-bearing 8-bit images are normalized
-    to RGB. Transparent pixels are composited onto white.
+    to RGB. Transparent pixels are composited on white. High-bit-depth input
+    is rejected instead of silently reducing scientific pixel precision.
 
-    High-bit-depth images are rejected instead of silently reducing their
-    pixel precision. ICC profile and DPI metadata are retained when available.
-    EXIF/XMP metadata is not blindly copied to derivative images.
+    ICC profile and DPI metadata are retained when suitable.
+    Other EXIF/XMP metadata is not blindly copied to derivative outputs.
     """
 
     warnings: list[str] = []
@@ -116,7 +126,6 @@ def _load_rgb_image(
 
         original_mode = source.mode
         source_format = (source.format or "").upper()
-
         mode = original_mode.upper()
 
         if (
@@ -127,12 +136,12 @@ def _load_rgb_image(
         ):
             raise ValueError(
                 f"High-bit-depth image mode {original_mode!r} is not "
-                "supported by Classic II. The image was not down-converted "
-                "because that could silently lose pixel precision."
+                "supported by this Classic II version. The image was "
+                "not down-converted, to avoid silently losing pixel precision."
             )
 
-        # Some TIFF decoders report RGB/RGBA even for files whose samples
-        # were stored at more than eight bits per channel.
+        # Some TIFF decoders expose an RGB/RGBA mode even when the TIFF
+        # declares more than eight bits per sample.
         if (
             source_format == "TIFF"
             and original_mode in {"RGB", "RGBA"}
@@ -150,8 +159,9 @@ def _load_rgb_image(
 
                     if bit_values and max(bit_values) > 8:
                         raise ValueError(
-                            "High-bit-depth TIFF input is not supported "
-                            f"by Classic II: {bit_values} bits per sample."
+                            f"High-bit-depth TIFF ({bit_values} bits per "
+                            "sample) is not supported by this Classic II "
+                            "processing path."
                         )
 
             except ValueError:
@@ -161,8 +171,8 @@ def _load_rgb_image(
                 TypeError,
                 OverflowError,
             ):
-                # If the TIFF bit-depth tag is unreadable, retain the
-                # explicit image-mode checks above.
+                # If the bit-depth tag cannot be read, the explicit
+                # mode checks above still apply.
                 pass
 
         try:
@@ -214,9 +224,9 @@ def _load_rgb_image(
                     rgba.close()
 
                 warnings.append(
-                    "The source contains transparency. Transparent pixels "
-                    "were composited onto white before Classic II processing; "
-                    "the processed image is RGB."
+                    "The input contained alpha/transparency. Transparent "
+                    "pixels were composited onto white before segmentation; "
+                    "the derivative is RGB."
                 )
 
             else:
@@ -239,7 +249,7 @@ def _load_rgb_image(
 
             if array.ndim != 3 or array.shape[2] != 3:
                 raise ValueError(
-                    "The source image could not be normalized to RGB."
+                    "The image could not be normalized to RGB."
                 )
 
             if min(array.shape[:2]) < 2:
@@ -279,29 +289,157 @@ def _load_rgb_image(
 
 
 # ---------------------------------------------------------------------
-# Low-saturation threshold
+# ---------------------------------------------------------------------
+# Directional rectangular opening — original Classic II footprints
+# ---------------------------------------------------------------------
+
+def _directional_opening(
+    mask: np.ndarray,
+    opening_factor: int,
+    orientation: str,
+) -> np.ndarray:
+    """Apply the original vertical or horizontal rectangular opening."""
+
+    if opening_factor < 0:
+        raise ValueError("Opening factor size cannot be negative.")
+
+    if opening_factor == 0:
+        return np.asarray(mask, dtype=bool).copy()
+
+    if orientation == "vertical":
+        footprint = np.ones((opening_factor, 1), dtype=bool)
+    elif orientation == "horizontal":
+        footprint = np.ones((1, opening_factor), dtype=bool)
+    else:
+        raise ValueError(f"Unsupported opening orientation: {orientation!r}")
+
+    # `morphology.opening` is the supported equivalent of the legacy
+    # binary-opening function for boolean masks; the footprint is unchanged.
+    return morphology.opening(
+        np.asarray(mask, dtype=bool),
+        footprint=footprint,
+    )
+
+
+# Connected components and border clearing
+# ---------------------------------------------------------------------
+
+def _largest_component(
+    mask: np.ndarray,
+) -> np.ndarray:
+    """Return the largest 8-connected foreground component."""
+
+    labels, count = ndi.label(
+        mask,
+        structure=_CONNECTIVITY_8,
+    )
+
+    if count == 0:
+        return np.asarray(mask, dtype=bool).copy()
+
+    sizes = np.bincount(labels.ravel())
+    sizes[0] = 0
+
+    return labels == int(sizes.argmax())
+
+
+def _clear_border(
+    mask: np.ndarray,
+) -> np.ndarray:
+    """Remove every 8-connected foreground component touching an image edge."""
+
+    labels, count = ndi.label(
+        mask,
+        structure=_CONNECTIVITY_8,
+    )
+
+    if count == 0:
+        return np.asarray(mask, dtype=bool).copy()
+
+    edge_labels = np.unique(
+        np.concatenate(
+            (
+                labels[0, :],
+                labels[-1, :],
+                labels[:, 0],
+                labels[:, -1],
+            )
+        )
+    )
+
+    edge_labels = edge_labels[edge_labels != 0]
+    result = np.asarray(mask, dtype=bool).copy()
+
+    if edge_labels.size:
+        result[np.isin(labels, edge_labels)] = False
+
+    return result
+
+
+# ---------------------------------------------------------------------
+# Optional preview callbacks
+# ---------------------------------------------------------------------
+
+class _PreviewCancelled(Exception):
+    """Internal signal that a replaceable preview request was cancelled."""
+
+
+def _check_preview_cancel(
+    cancel_event: Event | None,
+) -> None:
+    """Stop a stale preview between actual processing stages."""
+
+    if cancel_event is not None and cancel_event.is_set():
+        raise _PreviewCancelled(
+            "The preview request was replaced or cancelled."
+        )
+
+
+def _emit_preview_stage(
+    stage_callback: Callable[[str, np.ndarray], None] | None,
+    stage_name: str,
+    mask: np.ndarray,
+    cancel_event: Event | None,
+) -> None:
+    """
+    Offer an independent mask copy to the display callback.
+
+    Preview callback errors are ignored. A cancelled preview, however,
+    is allowed to stop its own preview request.
+    """
+
+    _check_preview_cancel(cancel_event)
+
+    if stage_callback is None:
+        return
+
+    try:
+        stage_callback(
+            stage_name,
+            np.asarray(mask, dtype=bool).copy(),
+        )
+    except _PreviewCancelled:
+        raise
+    except Exception:
+        # The visual component is optional and must not invalidate detection.
+        pass
+
+
+# ---------------------------------------------------------------------
+# Saturation threshold and Classic II segmentation
 # ---------------------------------------------------------------------
 
 def _low_saturation_mask(
     image_rgb: np.ndarray,
     threshold: float,
 ) -> np.ndarray:
-    """
-    Calculate HSV saturation from normalized 8-bit RGB pixels.
-
-    The formula matches the saturation channel used by RGB-to-HSV
-    conversion for RGB data normalized to the interval [0, 1].
-
-    Rows are processed in chunks to avoid creating an additional full-size
-    float64 image for high-resolution photographs.
-    """
+    """Calculate the low-saturation threshold used by RGB-to-HSV conversion."""
 
     height = image_rgb.shape[0]
     result = np.empty(
         image_rgb.shape[:2],
         dtype=bool,
     )
-
     chunk_rows = 512
 
     for start in range(0, height, chunk_rows):
@@ -335,155 +473,20 @@ def _low_saturation_mask(
     return result
 
 
-# ---------------------------------------------------------------------
-# Connected components
-# ---------------------------------------------------------------------
-
-def _largest_component(
-    mask: np.ndarray,
-) -> np.ndarray:
-    """Return the largest 8-connected foreground component."""
-
-    labels, count = ndi.label(
-        mask,
-        structure=CONNECTIVITY_8,
-    )
-
-    if count == 0:
-        return np.asarray(mask, dtype=bool).copy()
-
-    sizes = np.bincount(labels.ravel())
-    sizes[0] = 0
-
-    return labels == int(sizes.argmax())
-
-
-def _clear_border(
-    mask: np.ndarray,
-) -> np.ndarray:
-    """
-    Remove 8-connected components touching any image boundary.
-
-    This matches the 2-D connectivity used by the original Classic II method.
-    """
-
-    labels, count = ndi.label(
-        mask,
-        structure=CONNECTIVITY_8,
-    )
-
-    if count == 0:
-        return np.asarray(mask, dtype=bool).copy()
-
-    edge_labels = np.unique(
-        np.concatenate(
-            (
-                labels[0, :],
-                labels[-1, :],
-                labels[:, 0],
-                labels[:, -1],
-            )
-        )
-    )
-
-    edge_labels = edge_labels[edge_labels != 0]
-    result = np.asarray(mask, dtype=bool).copy()
-
-    if edge_labels.size:
-        result[np.isin(labels, edge_labels)] = False
-
-    return result
-
-
-# ---------------------------------------------------------------------
-# Directional rectangular opening and convex hull
-# ---------------------------------------------------------------------
-
-def _directional_opening(
-    mask: np.ndarray,
-    opening_factor: int,
-    orientation: str,
-) -> np.ndarray:
-    """
-    Apply the legacy rectangular opening in the specified image axis.
-
-    The legacy morphology.rectangle(height, width) footprint is represented
-    by a boolean array containing the same number of rows and columns.
-
-    opening_factor == 0 disables this operation; this avoids creating
-    an invalid zero-sized structuring element.
-    """
-
-    if opening_factor < 0:
-        raise ValueError(
-            "Opening factor size cannot be negative."
-        )
-
-    if opening_factor == 0:
-        return np.asarray(mask, dtype=bool).copy()
-
-    if orientation == "vertical":
-        footprint = np.ones(
-            (opening_factor, 1),
-            dtype=bool,
-        )
-    elif orientation == "horizontal":
-        footprint = np.ones(
-            (1, opening_factor),
-            dtype=bool,
-        )
-    else:
-        raise ValueError(
-            f"Unsupported opening orientation: {orientation!r}"
-        )
-
-    # Use scikit-image's binary opening to retain the original method's
-    # morphology behavior as closely as possible.
-    return morphology.binary_opening(
-        mask,
-        footprint,
-    )
-
-
-def _convex_hull_after_border_clearing(
-    mask: np.ndarray,
-) -> np.ndarray:
-    """Clear border components and construct the convex hull if nonempty."""
-
-    cleared = _clear_border(
-        np.asarray(mask, dtype=bool)
-    )
-
-    if not cleared.any():
-        return np.zeros_like(
-            cleared,
-            dtype=bool,
-        )
-
-    hull = convex_hull_image(cleared)
-
-    return np.asarray(
-        hull,
-        dtype=bool,
-    )
-
-
-# ---------------------------------------------------------------------
-# Classic II segmentation
-# ---------------------------------------------------------------------
-
 def detect_quadrat_mask(
     image_rgb: np.ndarray,
-    saturation_threshold: float = 0.1,
-    closing_radius: int = 40,
-    opening_factor: int = 300,
+    saturation_threshold: float = DEFAULT_SATURATION_THRESHOLD,
+    closing_radius: int = DEFAULT_CLOSING_RADIUS,
+    opening_factor: int = DEFAULT_OPENING_FACTOR,
+    *,
+    stage_callback: Callable[[str, np.ndarray], None] | None = None,
+    cancel_event: Event | None = None,
 ) -> np.ndarray:
     """
     Detect the quadrat using the original Auto (Classic II) sequence.
 
-    The two directional candidates are constructed independently from the
-    filled mask. Each candidate receives border clearing and a convex hull.
-    The legacy area-selection condition is preserved unchanged.
+    Preview callbacks are optional and presentation-only. The area-selection
+    condition from the legacy implementation is intentionally preserved.
     """
 
     if (
@@ -491,80 +494,121 @@ def detect_quadrat_mask(
         or image_rgb.ndim != 3
         or image_rgb.shape[2] != 3
     ):
-        raise ValueError(
-            "Classic II requires an 8-bit RGB image."
-        )
+        raise ValueError("Classic II requires an 8-bit RGB image.")
 
     if min(image_rgb.shape[:2]) < 2:
-        raise ValueError(
-            "The image is too small to process."
-        )
+        raise ValueError("The image is too small to process.")
 
     if not 0.0 <= saturation_threshold <= 1.0:
-        raise ValueError(
-            "Saturation threshold must be between 0 and 1."
-        )
+        raise ValueError("Saturation threshold must be between 0 and 1.")
 
     if closing_radius < 0:
-        raise ValueError(
-            "Closing radius cannot be negative."
-        )
+        raise ValueError("Closing radius cannot be negative.")
 
     if opening_factor < 0:
-        raise ValueError(
-            "Opening factor size cannot be negative."
-        )
+        raise ValueError("Opening factor size cannot be negative.")
 
-    # Step 1: pixels with saturation below the chosen threshold.
-    seg = _low_saturation_mask(
-        image_rgb,
-        saturation_threshold,
-    )
+    _check_preview_cancel(cancel_event)
 
-    # Step 2: small-scale isotropic opening.
-    seg_cleaned = morphology.isotropic_opening(
+    # Stage 1: low-saturation candidate mask.
+    seg = _low_saturation_mask(image_rgb, saturation_threshold)
+    _emit_preview_stage(
+        stage_callback,
+        "1 / 9 · Low-saturation candidates",
         seg,
-        1,
+        cancel_event,
     )
 
-    # Step 3: isotropic closing with the user-selected radius.
+    # Stage 2: original small-scale isotropic opening.
+    seg_cleaned = morphology.isotropic_opening(seg, 1)
+    _emit_preview_stage(
+        stage_callback,
+        "2 / 9 · Initial isotropic opening",
+        seg_cleaned,
+        cancel_event,
+    )
+
+    # Stage 3: isotropic closing with the selected radius.
     seg_cleaned = morphology.isotropic_closing(
         seg_cleaned,
         closing_radius,
     )
+    _emit_preview_stage(
+        stage_callback,
+        "3 / 9 · Isotropic closing",
+        seg_cleaned,
+        cancel_event,
+    )
 
-    # Steps 4 and 5: identify the largest background component and invert it.
+    # Stage 4: largest background component followed by inversion.
     background = _largest_component(~seg_cleaned)
     filled = ~background
+    _emit_preview_stage(
+        stage_callback,
+        "4 / 9 · Largest background removed",
+        filled,
+        cancel_event,
+    )
 
-    # Step 6: directional rectangular openings.
-    #
-    # The mapping of the two candidate names to their footprints follows
-    # the original v1.0 implementation exactly.
+    # Stage 5: legacy candidate named mask_hor uses the vertical footprint.
     mask_hor = _directional_opening(
         filled,
         opening_factor,
         "vertical",
     )
-
-    mask_hor = _convex_hull_after_border_clearing(
-        mask_hor
+    _emit_preview_stage(
+        stage_callback,
+        "5 / 9 · Candidate A — vertical opening",
+        mask_hor,
+        cancel_event,
     )
 
+    # Stage 6: border clearing and convex hull for candidate A.
+    cleared_hor = _clear_border(mask_hor)
+    if cleared_hor.any():
+        mask_hor = np.asarray(
+            convex_hull_image(cleared_hor),
+            dtype=bool,
+        )
+    else:
+        mask_hor = np.zeros_like(cleared_hor, dtype=bool)
+    _emit_preview_stage(
+        stage_callback,
+        "6 / 9 · Candidate A — border-cleared convex hull",
+        mask_hor,
+        cancel_event,
+    )
+
+    # Stage 7: legacy candidate named mask_ver uses the horizontal footprint.
     mask_ver = _directional_opening(
         filled,
         opening_factor,
         "horizontal",
     )
-
-    mask_ver = _convex_hull_after_border_clearing(
-        mask_ver
+    _emit_preview_stage(
+        stage_callback,
+        "7 / 9 · Candidate B — horizontal opening",
+        mask_ver,
+        cancel_event,
     )
 
-    # Step 7: preserve the original v1.0 area-selection decision.
-    #
-    # Do not reverse this condition without comparing the results against
-    # representative legacy outputs and confirming the intended behavior.
+    # Stage 8: border clearing and convex hull for candidate B.
+    cleared_ver = _clear_border(mask_ver)
+    if cleared_ver.any():
+        mask_ver = np.asarray(
+            convex_hull_image(cleared_ver),
+            dtype=bool,
+        )
+    else:
+        mask_ver = np.zeros_like(cleared_ver, dtype=bool)
+    _emit_preview_stage(
+        stage_callback,
+        "8 / 9 · Candidate B — border-cleared convex hull",
+        mask_ver,
+        cancel_event,
+    )
+
+    # Stage 9: preserve the original v1.0 decision exactly.
     area_hor = int(np.count_nonzero(mask_hor))
     area_ver = int(np.count_nonzero(mask_ver))
 
@@ -579,20 +623,23 @@ def detect_quadrat_mask(
             "the saturation threshold or morphological parameters."
         )
 
-    return np.asarray(
+    _emit_preview_stage(
+        stage_callback,
+        "9 / 9 · Final quadrat mask",
         mask,
-        dtype=bool,
+        cancel_event,
     )
 
+    return np.asarray(mask, dtype=bool)
 
-# ---------------------------------------------------------------------
+
 # Output helpers
 # ---------------------------------------------------------------------
 
 def _orientation_was_normalized(
     source_metadata: dict,
 ) -> bool:
-    """Return whether EXIF Orientation requires transforming the decoded pixels."""
+    """Return whether EXIF Orientation should have transformed decoded pixels."""
 
     try:
         orientation = int(
@@ -603,8 +650,28 @@ def _orientation_was_normalized(
 
     return (
         orientation
-        in EXIF_ORIENTATIONS_THAT_TRANSFORM_PIXELS
+        in _EXIF_ORIENTATIONS_THAT_TRANSFORM_PIXELS
     )
+
+
+def _record_save_warnings(
+    run_log: ProcessingRunLog,
+    summary_warnings: list[str],
+    input_filename: str,
+    output_path: Path,
+    warnings: tuple[str, ...] | list[str],
+) -> None:
+    """Record central output warnings with the actual output filename."""
+
+    for warning in warnings:
+        entry = f"{input_filename} -> {output_path.name}: {warning}"
+
+        summary_warnings.append(entry)
+
+        run_log.record_warning(
+            f"{input_filename} -> {output_path.name}",
+            warning,
+        )
 
 
 def _make_plan(
@@ -618,7 +685,7 @@ def _make_plan(
     orientation_normalized: bool,
     jpegtran: str | None,
 ):
-    """Create an output plan through the central output policy."""
+    """Create an output plan through the central image-output policy."""
 
     return plan_output(
         source_path=source_path,
@@ -634,32 +701,167 @@ def _make_plan(
     )
 
 
-def _record_save_warnings(
-    run_log: ProcessingRunLog,
-    summary_warnings: list[str],
-    input_filename: str,
-    output_path: Path,
-    warnings: tuple[str, ...] | list[str],
-) -> None:
-    """Record central save warnings together with the output filename."""
+# ---------------------------------------------------------------------
+# Preview/test worker — never saves output
+# ---------------------------------------------------------------------
 
-    for warning in warnings:
-        summary_warnings.append(
-            f"{input_filename} -> {output_path.name}: {warning}"
-        )
+class ClassicIIPreviewWorker(QThread):
+    """Compute a preview or test without creating any output files."""
 
-        run_log.record_warning(
-            f"{input_filename} -> {output_path.name}",
-            warning,
+    stage_ready = Signal(int, str, object)
+    completed = Signal(int, object)
+
+    def __init__(
+        self,
+        request_id: int,
+        image_path: Path,
+        saturation_threshold: float,
+        closing_radius: int,
+        opening_factor: int,
+        background_name: str,
+        *,
+        test_mode: bool,
+        original_only: bool = False,
+    ) -> None:
+        super().__init__()
+
+        self.request_id = int(request_id)
+        self.image_path = Path(image_path)
+
+        self.saturation_threshold = float(saturation_threshold)
+        self.closing_radius = int(closing_radius)
+        self.opening_factor = int(opening_factor)
+        self.background_name = str(background_name)
+        self.test_mode = bool(test_mode)
+        self.original_only = bool(original_only)
+
+        self.cancel_event = Event()
+
+    def request_cancel(self) -> None:
+        """Cancel an obsolete preview between processing stages."""
+
+        self.cancel_event.set()
+
+    def run(self) -> None:
+        result = {
+            "success": False,
+            "cancelled": False,
+            "error": None,
+            "bbox": None,
+            "mask_pixels": 0,
+            "warnings": [],
+            "test_mode": self.test_mode,
+            "original_only": self.original_only,
+        }
+
+        try:
+            _check_preview_cancel(self.cancel_event)
+
+            inspect_image(self.image_path)
+
+            image_rgb, _metadata, input_warnings = _load_rgb_image(
+                self.image_path
+            )
+
+            result["warnings"] = list(input_warnings)
+
+            _check_preview_cancel(self.cancel_event)
+
+            # Only the visual copy is reduced in size.
+            preview_base = make_preview_base(image_rgb)
+
+            self.stage_ready.emit(
+                self.request_id,
+                f"Original image · {self.image_path.name}",
+                rgb_array_to_qimage(preview_base),
+            )
+
+            if self.original_only:
+                # Folder selection should show the source image immediately.
+                # Do not run segmentation for this lightweight display request.
+                _check_preview_cancel(self.cancel_event)
+                result["success"] = True
+            else:
+                background_rgb = BACKGROUND_RGB[
+                    self.background_name
+                ]
+
+                def stage_callback(
+                    stage_name: str,
+                    stage_mask: np.ndarray,
+                ) -> None:
+                    _check_preview_cancel(self.cancel_event)
+
+                    frame = render_processing_preview(
+                        preview_base,
+                        stage_mask,
+                        stage_name,
+                        background_rgb,
+                    )
+
+                    self.stage_ready.emit(
+                        self.request_id,
+                        stage_name,
+                        frame,
+                    )
+
+                mask = detect_quadrat_mask(
+                    image_rgb,
+                    self.saturation_threshold,
+                    self.closing_radius,
+                    self.opening_factor,
+                    stage_callback=stage_callback,
+                    cancel_event=self.cancel_event,
+                )
+
+                _check_preview_cancel(self.cancel_event)
+
+                ys, xs = np.nonzero(mask)
+
+                if not xs.size or not ys.size:
+                    raise ValueError(
+                        "The detected quadrat mask is empty."
+                    )
+
+                left = int(xs.min())
+                right = int(xs.max()) + 1
+                top = int(ys.min())
+                bottom = int(ys.max()) + 1
+
+                result.update(
+                    {
+                        "success": True,
+                        "bbox": (
+                            left,
+                            top,
+                            right,
+                            bottom,
+                        ),
+                        "mask_pixels": int(np.count_nonzero(mask)),
+                    }
+                )
+
+        except _PreviewCancelled:
+            result["cancelled"] = True
+
+        except Exception as exc:
+            result["error"] = (
+                f"{type(exc).__name__}: {exc}"
+            )
+
+        self.completed.emit(
+            self.request_id,
+            result,
         )
 
 
 # ---------------------------------------------------------------------
-# Background worker
+# Background worker — batch processing and output saving
 # ---------------------------------------------------------------------
 
 class ClassicIIWorker(QThread):
     progress_changed = Signal(int, int, str)
+    preview_frame = Signal(str, object)
     completed = Signal(object)
 
     def __init__(
@@ -672,6 +874,7 @@ class ClassicIIWorker(QThread):
         background_name: str,
         output_policy: OutputPolicy,
         jpegtran: str | None = None,
+        preview_enabled: bool = False,
     ) -> None:
         super().__init__()
 
@@ -683,6 +886,7 @@ class ClassicIIWorker(QThread):
         self.opening_factor = int(opening_factor)
         self.background_name = background_name
         self.output_policy = output_policy
+        self.preview_enabled = bool(preview_enabled)
 
         self.jpegtran = (
             jpegtran
@@ -709,7 +913,7 @@ class ClassicIIWorker(QThread):
         run_log: ProcessingRunLog,
         summary_warnings: list[str],
     ):
-        """Save the detected crop using the central output module."""
+        """Save the crop centrally, with a policy-preserving JPEG fallback."""
 
         crop_plan = _make_plan(
             image_path,
@@ -734,8 +938,8 @@ class ClassicIIWorker(QThread):
             )
 
         except Exception as exc:
-            # Only an explicitly planned JPEG coefficient-domain route may
-            # use this fallback. The selected output policy is kept intact.
+            # Only fall back if the central planner explicitly selected
+            # the JPEG coefficient-domain crop strategy.
             if not str(crop_plan.strategy).startswith("jpegtran"):
                 raise
 
@@ -760,20 +964,20 @@ class ClassicIIWorker(QThread):
                 jpegtran=self.jpegtran,
             )
 
-            fallback_warning = (
-                "The JPEG coefficient-domain crop could not be verified. "
-                "The crop was re-planned under the selected output policy. "
+            message = (
+                "JPEG coefficient-domain crop could not be verified. "
+                "The output was re-planned under the selected output policy. "
                 f"Original failure: {type(exc).__name__}: {exc}. "
                 f"Fallback strategy: {fallback_result.strategy}."
             )
 
             summary_warnings.append(
-                f"{image_path.name}: {fallback_warning}"
+                f"{image_path.name}: {message}"
             )
 
             run_log.record_warning(
                 image_path.name,
-                fallback_warning,
+                message,
             )
 
             crop_plan = fallback_plan
@@ -794,10 +998,8 @@ class ClassicIIWorker(QThread):
 
         succeeded = 0
         attempted = 0
-
         errors: list[str] = []
         warnings: list[str] = []
-
         cancelled = False
         fatal_error = None
         run_log = None
@@ -861,12 +1063,53 @@ class ClassicIIWorker(QThread):
                         _orientation_was_normalized(source_metadata)
                     )
 
+                    # Visual work is skipped entirely when Show preview
+                    # is off. The analysis array is unaffected either way.
+                    stage_callback = None
+
+                    if self.preview_enabled:
+                        try:
+                            preview_base = make_preview_base(image_rgb)
+
+                            self.preview_frame.emit(
+                                f"{image_path.name} · Original image",
+                                rgb_array_to_qimage(preview_base),
+                            )
+
+                            def batch_stage_callback(
+                                stage_name: str,
+                                stage_mask: np.ndarray,
+                            ) -> None:
+                                frame = render_processing_preview(
+                                    preview_base,
+                                    stage_mask,
+                                    stage_name,
+                                    background_rgb,
+                                )
+
+                                self.preview_frame.emit(
+                                    f"{image_path.name} · {stage_name}",
+                                    frame,
+                                )
+
+                            stage_callback = batch_stage_callback
+
+                        except Exception:
+                            # Preview setup failures must not affect detection.
+                            stage_callback = None
+
                     mask = detect_quadrat_mask(
                         image_rgb,
                         self.saturation_threshold,
                         self.closing_radius,
                         self.opening_factor,
+                        stage_callback=stage_callback,
                     )
+
+                    # Preserve source pixels within the selected mask.
+                    # Replace pixels outside the region with the chosen color.
+                    segmented = image_rgb.copy()
+                    segmented[~mask] = background_rgb
 
                     ys, xs = np.nonzero(mask)
 
@@ -875,31 +1118,15 @@ class ClassicIIWorker(QThread):
                             "The detected quadrat mask is empty."
                         )
 
-                    # The bottom and right crop coordinates are exclusive.
-                    # Add one to include the last selected pixel.
                     left = int(xs.min())
                     right = int(xs.max()) + 1
                     top = int(ys.min())
                     bottom = int(ys.max()) + 1
 
-                    crop_box = (
-                        left,
-                        top,
-                        right,
-                        bottom,
-                    )
-
-                    # The crop retains the original RGB pixels inside the
-                    # detected bounding rectangle. Segmentation separately
-                    # replaces pixels outside the selected mask.
                     cropped = image_rgb[
                         top:bottom,
                         left:right,
-                        :,
                     ]
-
-                    segmented = image_rgb.copy()
-                    segmented[~mask] = background_rgb
 
                     cropped_image = Image.fromarray(
                         np.ascontiguousarray(
@@ -921,7 +1148,7 @@ class ClassicIIWorker(QThread):
                             cropped_image=cropped_image,
                             metadata=metadata,
                             source_metadata=source_metadata,
-                            crop_box=crop_box,
+                            crop_box=(left, top, right, bottom),
                             orientation_normalized=orientation_normalized,
                             run_log=run_log,
                             summary_warnings=warnings,
@@ -960,20 +1187,21 @@ class ClassicIIWorker(QThread):
                         cropped_image.close()
                         segmented_image.close()
 
+                    # Explicitly report first-frame-only handling for
+                    # multi-frame formats, especially MPO.
                     if source_metadata["frames"] > 1:
                         if source_metadata["format"] == "MPO":
                             frame_warning = (
-                                "The source is an MPO container. Only its "
-                                "primary image was processed; secondary "
-                                "pictures or thumbnails were excluded from "
-                                "the derivatives. The original MPO file "
-                                "was not modified."
+                                "The source is MPO. Only its primary image "
+                                "was processed; secondary pictures or "
+                                "thumbnails were excluded. The original "
+                                "MPO file was not modified."
                             )
                         else:
                             frame_warning = (
-                                f"The source contains {source_metadata['frames']} "
-                                "frames/pages. Classic II processed only the "
-                                "first frame/page."
+                                f"The source contains "
+                                f"{source_metadata['frames']} frames/pages. "
+                                "Classic II processed only the first frame/page."
                             )
 
                         warnings.append(
@@ -992,7 +1220,8 @@ class ClassicIIWorker(QThread):
                         f"crop_pixels_verified={crop_result.pixels_verified}; "
                         f"segmented={seg_result.path.name}; "
                         f"segmented_strategy={seg_result.strategy}; "
-                        f"segmented_pixels_verified={seg_result.pixels_verified}; "
+                        f"segmented_pixels_verified="
+                        f"{seg_result.pixels_verified}; "
                         f"policy={self.output_policy.value}"
                     )
 
@@ -1056,7 +1285,7 @@ class ClassicIIWorker(QThread):
 # ---------------------------------------------------------------------
 
 class AutoClassicIIDialog(QDialog):
-    """Settings and batch-processing window for Auto (Classic II)."""
+    """Settings, explicit test preview and batch-processing window."""
 
     def __init__(
         self,
@@ -1067,10 +1296,34 @@ class AutoClassicIIDialog(QDialog):
         self.setWindowTitle(
             "Easy Quadrat — Auto (Classic II)"
         )
-        self.setMinimumWidth(620)
-        self.resize(700, 560)
+
+        self.setWindowFlag(
+            Qt.WindowType.WindowMaximizeButtonHint,
+            True,
+        )
+        self.setWindowFlag(
+            Qt.WindowType.WindowMinimizeButtonHint,
+            True,
+        )
+        self.setSizeGripEnabled(True)
+
+        self.setMinimumSize(880, 600)
+        self.resize(1180, 760)
 
         self._worker: ClassicIIWorker | None = None
+        self._preview_worker: ClassicIIPreviewWorker | None = None
+
+        self._first_image_path: Path | None = None
+        self._source_preview_frame = None
+        self._preview_request_id = 0
+        self._preview_pending_mode: str | None = None
+        self._close_when_idle = False
+
+        # Retain visual frames from the most recent explicit test only.
+        # These QImage copies are display-only and never feed the detector.
+        self._test_stage_history: list[tuple[str, object]] = []
+        self._test_stage_index = -1
+        self._test_stage_history_ready = False
 
         configure_window(
             self,
@@ -1092,123 +1345,255 @@ class AutoClassicIIDialog(QDialog):
         layout.addWidget(title)
 
         intro = QLabel(
-            "Detect the quadrat using color saturation, isotropic "
-            "morphology, directional rectangular openings and convex-hull "
-            "processing. This follows the original Classic II sequence. "
-            "Inspect the results before using them for measurements."
+            "Detect the quadrat using color saturation, isotropic morphology, "
+            "directional rectangular openings and convex-hull processing. "
+            "Run a test to inspect all nine processing stages without saving "
+            "outputs. Review the candidate masks before using results for "
+            "measurements."
         )
         intro.setWordWrap(True)
         intro.setObjectName("sectionDescription")
         layout.addWidget(intro)
 
         # -------------------------------------------------------------
-        # Input and output folders
+        # Two-column layout: compact controls and larger preview
         # -------------------------------------------------------------
 
-        folders = QFormLayout()
-        folders.setHorizontalSpacing(12)
-        folders.setVerticalSpacing(9)
+        content_layout = QHBoxLayout()
+        content_layout.setSpacing(16)
 
-        input_row = QHBoxLayout()
+        left_widget = QWidget()
+        left_widget.setMinimumWidth(360)
 
-        self.input_path_edit = QLineEdit()
-        self.input_path_edit.setReadOnly(True)
-        self.input_path_edit.setPlaceholderText(
-            "Select a folder containing images"
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(9)
+
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(8)
+
+        self.show_preview_checkbox = QCheckBox("Show preview")
+        self.show_preview_checkbox.setChecked(True)
+        self.show_preview_checkbox.setToolTip(
+            "Turn off the preview panel and all preview rendering. "
+            "Detection and output saving continue without display frames."
+        )
+        self.show_preview_checkbox.toggled.connect(
+            self._on_show_preview_toggled
+        )
+        right_layout.addWidget(self.show_preview_checkbox)
+
+        self.preview_panel = ProcessingPreviewPanel(
+            enable_stage_navigation=True,
+        )
+        self.preview_panel.test_requested.connect(
+            self._run_test
+        )
+        self.preview_panel.previous_stage_requested.connect(
+            self._show_previous_test_stage
+        )
+        self.preview_panel.next_stage_requested.connect(
+            self._show_next_test_stage
+        )
+        right_layout.addWidget(
+            self.preview_panel,
+            1,
         )
 
-        self.input_browse_button = QPushButton("Browse…")
-        self.input_browse_button.clicked.connect(
-            self._browse_input
+        content_layout.addWidget(
+            left_widget,
+            2,
         )
-
-        input_row.addWidget(self.input_path_edit, 1)
-        input_row.addWidget(self.input_browse_button)
-
-        folders.addRow("Input folder", input_row)
-
-        output_row = QHBoxLayout()
-
-        self.output_path_edit = QLineEdit()
-        self.output_path_edit.setReadOnly(True)
-        self.output_path_edit.setPlaceholderText(
-            "Select an output folder"
+        content_layout.addWidget(
+            right_widget,
+            3,
         )
-
-        self.output_browse_button = QPushButton("Browse…")
-        self.output_browse_button.clicked.connect(
-            self._browse_output
-        )
-
-        output_row.addWidget(self.output_path_edit, 1)
-        output_row.addWidget(self.output_browse_button)
-
-        folders.addRow("Output folder", output_row)
-
-        layout.addLayout(folders)
 
         # -------------------------------------------------------------
-        # Method parameters — the v1.0 defaults are retained
+        # Input and output folders — label, path and button on one row
         # -------------------------------------------------------------
 
-        settings = QFormLayout()
-        settings.setHorizontalSpacing(12)
-        settings.setVerticalSpacing(10)
+        def add_folder_row(
+            label_text: str,
+            placeholder: str,
+            browse_callback,
+        ) -> tuple[QLineEdit, QPushButton]:
+            row = QHBoxLayout()
+            row.setContentsMargins(0, 0, 0, 0)
+            row.setSpacing(7)
+
+            label = QLabel(label_text)
+            label.setFixedWidth(84)
+            label.setWordWrap(False)
+            label.setAlignment(
+                Qt.AlignmentFlag.AlignLeft
+                | Qt.AlignmentFlag.AlignVCenter
+            )
+
+            path_edit = QLineEdit()
+            path_edit.setReadOnly(True)
+            path_edit.setMinimumWidth(80)
+            path_edit.setPlaceholderText(placeholder)
+            path_edit.setToolTip(placeholder)
+
+            browse_button = QPushButton("Browse…")
+            browse_button.setFixedWidth(76)
+            browse_button.clicked.connect(browse_callback)
+
+            row.addWidget(label)
+            row.addWidget(path_edit, 1)
+            row.addWidget(browse_button)
+            left_layout.addLayout(row)
+
+            return path_edit, browse_button
+
+        self.input_path_edit, self.input_browse_button = add_folder_row(
+            "Input folder",
+            "Choose input folder",
+            self._browse_input,
+        )
+
+        self.output_path_edit, self.output_browse_button = add_folder_row(
+            "Output folder",
+            "Choose output folder",
+            self._browse_output,
+        )
+
+        # -------------------------------------------------------------
+        # Method parameters — aligned labels and equal-width controls
+        # -------------------------------------------------------------
+
+        settings_container = QWidget()
+        settings_container.setSizePolicy(
+            QSizePolicy.Policy.Preferred,
+            QSizePolicy.Policy.Fixed,
+        )
+
+        settings = QGridLayout(settings_container)
+        settings.setContentsMargins(0, 24, 0, 0)
+        settings.setHorizontalSpacing(8)
+        settings.setVerticalSpacing(5)
+        settings.setColumnMinimumWidth(0, 174)
+        settings.setColumnStretch(1, 0)
+
+        # Keep a deliberate gap before Reset, without affecting
+        # the spacing between the four parameter rows.
+        settings.setRowMinimumHeight(4, 10)
+
+        def add_setting_row(
+            row: int,
+            label_text: str,
+            control: QWidget,
+        ) -> None:
+            label = QLabel(label_text)
+            label.setWordWrap(False)
+            label.setMinimumWidth(174)
+            label.setMaximumWidth(174)
+            label.setAlignment(
+                Qt.AlignmentFlag.AlignLeft
+                | Qt.AlignmentFlag.AlignVCenter
+            )
+
+            control.setMinimumWidth(140)
+            control.setMaximumWidth(145)
+            control.setFixedHeight(26)
+
+            settings.addWidget(label, row, 0)
+            settings.addWidget(
+                control,
+                row,
+                1,
+                1,
+                1,
+                Qt.AlignmentFlag.AlignLeft
+                | Qt.AlignmentFlag.AlignVCenter,
+            )
 
         self.saturation_spin = QDoubleSpinBox()
         self.saturation_spin.setRange(0.0, 1.0)
         self.saturation_spin.setDecimals(6)
         self.saturation_spin.setSingleStep(0.01)
-        self.saturation_spin.setValue(0.1)
-        self.saturation_spin.setToolTip(
-            "Pixels whose HSV saturation is strictly below this "
-            "value are candidates for background."
+        self.saturation_spin.setValue(
+            DEFAULT_SATURATION_THRESHOLD
         )
-
-        settings.addRow(
+        self.saturation_spin.setToolTip(
+            "Pixels whose HSV saturation is strictly below this value "
+            "are candidates for background. Range: 0–1."
+        )
+        add_setting_row(
+            0,
             "Saturation threshold (0–1)",
             self.saturation_spin,
         )
 
         self.closing_spin = QSpinBox()
         self.closing_spin.setRange(0, 5000)
-        self.closing_spin.setValue(40)
+        self.closing_spin.setValue(DEFAULT_CLOSING_RADIUS)
         self.closing_spin.setSuffix(" px")
         self.closing_spin.setToolTip(
-            "Radius of the isotropic closing operation."
+            "Radius used by the isotropic closing operation."
         )
-
-        settings.addRow(
+        add_setting_row(
+            1,
             "Closing radius",
             self.closing_spin,
         )
 
         self.opening_spin = QSpinBox()
         self.opening_spin.setRange(0, 5000)
-        self.opening_spin.setValue(300)
+        self.opening_spin.setValue(DEFAULT_OPENING_FACTOR)
         self.opening_spin.setSuffix(" px")
         self.opening_spin.setToolTip(
-            "Legacy rectangular opening footprint size. The method "
-            "evaluates both vertical and horizontal rectangular footprints."
+            "Size of the rectangular footprint used for both vertical and "
+            "horizontal directional openings. Set to zero to disable them."
         )
-
-        settings.addRow(
+        add_setting_row(
+            2,
             "Opening factor size",
             self.opening_spin,
         )
 
         self.background_combo = QComboBox()
-        self.background_combo.addItems(
-            list(BACKGROUND_RGB)
+        self.background_combo.addItems(list(BACKGROUND_RGB))
+        self.background_combo.setCurrentText(
+            DEFAULT_BACKGROUND_NAME
         )
-        self.background_combo.setCurrentText("Black")
-
-        settings.addRow(
-            "Segmented-image background",
+        add_setting_row(
+            3,
+            "Segmented background",
             self.background_combo,
         )
 
-        layout.addLayout(settings)
+        self.reset_button = QPushButton("Reset")
+        self.reset_button.setFixedWidth(90)
+        self.reset_button.setToolTip(
+            "Restore all Classic II parameters to their default values."
+        )
+        self.reset_button.clicked.connect(
+            self._reset_parameters
+        )
+
+        settings.addWidget(
+            self.reset_button,
+            5,
+            1,
+            1,
+            1,
+            Qt.AlignmentFlag.AlignLeft
+            | Qt.AlignmentFlag.AlignVCenter,
+        )
+
+        left_layout.addWidget(
+            settings_container,
+            0,
+            Qt.AlignmentFlag.AlignTop,
+        )
+
+        # -------------------------------------------------------------
+        # Output information — constrained to the control column
+        # -------------------------------------------------------------
 
         note = QLabel(
             "Outputs: Segmented images/S_<filename>, "
@@ -1220,23 +1605,28 @@ class AutoClassicIIDialog(QDialog):
             "down-converted."
         )
         note.setWordWrap(True)
+        note.setMinimumWidth(0)
         note.setObjectName("cardText")
-        layout.addWidget(note)
+        left_layout.addWidget(note)
 
-        self.progress_label = QLabel("Ready")
+        # Progress controls remain hidden except during batch processing.
+        self.progress_label = QLabel()
         self.progress_label.setWordWrap(True)
-        layout.addWidget(self.progress_label)
+        self.progress_label.hide()
+        left_layout.addWidget(self.progress_label)
 
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 1)
         self.progress_bar.setValue(0)
-        layout.addWidget(self.progress_bar)
+        self.progress_bar.hide()
+        left_layout.addWidget(self.progress_bar)
 
         # -------------------------------------------------------------
         # Actions
         # -------------------------------------------------------------
 
         buttons = QHBoxLayout()
+        buttons.setSpacing(8)
         buttons.addStretch(1)
 
         self.run_button = QPushButton("Run Classic II")
@@ -1254,10 +1644,29 @@ class AutoClassicIIDialog(QDialog):
         )
         buttons.addWidget(self.cancel_button)
 
-        layout.addLayout(buttons)
+        buttons.addStretch(1)
+        left_layout.addLayout(buttons)
+
+        # Parameter changes do not start the detector automatically.
+        self.saturation_spin.valueChanged.connect(
+            self._on_parameters_changed
+        )
+        self.closing_spin.valueChanged.connect(
+            self._on_parameters_changed
+        )
+        self.opening_spin.valueChanged.connect(
+            self._on_parameters_changed
+        )
+        self.background_combo.currentTextChanged.connect(
+            self._on_parameters_changed
+        )
+
+        layout.addLayout(content_layout, 1)
+
+        self._update_action_states()
 
     # -----------------------------------------------------------------
-    # Folder selection
+    # Folder selection and initial preview
     # -----------------------------------------------------------------
 
     @Slot()
@@ -1271,6 +1680,8 @@ class AutoClassicIIDialog(QDialog):
 
         if folder:
             self.input_path_edit.setText(folder)
+            self.input_path_edit.setToolTip(folder)
+            self._refresh_first_input_preview()
 
     @Slot()
     def _browse_output(self) -> None:
@@ -1283,9 +1694,648 @@ class AutoClassicIIDialog(QDialog):
 
         if folder:
             self.output_path_edit.setText(folder)
+            self.output_path_edit.setToolTip(folder)
+
+    def _clear_test_stage_history(self) -> None:
+        """Discard stale test stages and disable manual stage navigation."""
+
+        self._test_stage_history.clear()
+        self._test_stage_index = -1
+        self._test_stage_history_ready = False
+        self.preview_panel.set_stage_navigation_state(
+            previous_enabled=False,
+            next_enabled=False,
+        )
+
+    def _invalidate_pending_preview(self) -> None:
+        """Invalidate outdated preview requests and cancel active preview work."""
+
+        self._clear_test_stage_history()
+        self._preview_request_id += 1
+        self._preview_pending_mode = None
+
+        if (
+            self._preview_worker is not None
+            and self._preview_worker.isRunning()
+        ):
+            self._preview_worker.request_cancel()
+
+    def _refresh_first_input_preview(self) -> None:
+        """Find the first input image and display it without segmentation."""
+
+        self._invalidate_pending_preview()
+        self._source_preview_frame = None
+
+        input_text = self.input_path_edit.text().strip()
+
+        if not input_text:
+            self._first_image_path = None
+            self.preview_panel.set_placeholder(
+                "Select an input folder first."
+            )
+            self.preview_panel.set_status(
+                "No input image selected."
+            )
+            self._update_action_states()
+            return
+
+        try:
+            image_files = list_image_files(
+                Path(input_text).expanduser()
+            )
+        except (OSError, ValueError) as exc:
+            self._first_image_path = None
+            self.preview_panel.set_placeholder(
+                "The selected folder could not be read."
+            )
+            self.preview_panel.set_status(
+                f"Input preview unavailable: {exc}",
+                "error",
+            )
+            self._update_action_states()
+            return
+
+        if not image_files:
+            self._first_image_path = None
+            self.preview_panel.set_placeholder(
+                "No supported images were found in this folder."
+            )
+            self.preview_panel.set_status(
+                "Select a folder containing supported images.",
+                "error",
+            )
+            self._update_action_states()
+            return
+
+        self._first_image_path = image_files[0]
+
+        if not self.show_preview_checkbox.isChecked():
+            self.preview_panel.set_placeholder(
+                "Preview is disabled."
+            )
+            self.preview_panel.set_status(
+                "Enable Show preview to display the source image."
+            )
+            self._update_action_states()
+            return
+
+        self._queue_original_preview()
+
+    def _queue_original_preview(self) -> None:
+        """Load and display the first source image without running detection."""
+
+        if (
+            not self.show_preview_checkbox.isChecked()
+            or self._first_image_path is None
+            or self._worker is not None
+        ):
+            return
+
+        self._preview_request_id += 1
+        self._preview_pending_mode = "original"
+
+        self.preview_panel.set_placeholder(
+            f"Loading original image:\n{self._first_image_path.name}"
+        )
+        self.preview_panel.set_status(
+            "Loading the first source image. Detection has not started.",
+            "working",
+        )
+
+        if self._preview_worker is not None:
+            if self._preview_worker.isRunning():
+                self._preview_worker.request_cancel()
+        else:
+            self._start_pending_preview()
+
+        self._update_action_states()
 
     # -----------------------------------------------------------------
-    # Messages
+    # Show preview toggle
+    # -----------------------------------------------------------------
+
+    @Slot(bool)
+    def _on_show_preview_toggled(
+        self,
+        enabled: bool,
+    ) -> None:
+        """Enable or disable preview display without launching a test."""
+
+        self._invalidate_pending_preview()
+
+        if not enabled:
+            self.preview_panel.set_placeholder(
+                "Preview is disabled."
+            )
+            self.preview_panel.set_status(
+                "Preview rendering is off. Batch processing and output "
+                "saving remain available."
+            )
+            self.preview_panel.setEnabled(False)
+
+        else:
+            self.preview_panel.setEnabled(True)
+
+            if self._first_image_path is None:
+                self.preview_panel.set_placeholder(
+                    "Select an input folder to display its first image."
+                )
+                self.preview_panel.set_status(
+                    "The source image will appear automatically after selection."
+                )
+            else:
+                if self._source_preview_frame is not None:
+                    self.preview_panel.set_frame(
+                        self._source_preview_frame,
+                        f"Original image · {self._first_image_path.name}",
+                    )
+                    self.preview_panel.set_status(
+                        "Original image displayed. Click Run a test to inspect "
+                        "the processing stages."
+                    )
+                    self._update_action_states()
+                else:
+                    self._queue_original_preview()
+                return
+
+        self._update_action_states()
+
+    # -----------------------------------------------------------------
+    # Parameter changes and reset
+    # -----------------------------------------------------------------
+
+    @Slot()
+    def _on_parameters_changed(
+        self,
+        *_args,
+    ) -> None:
+        """Mark the preview as outdated; do not launch automatic processing."""
+
+        if not self.show_preview_checkbox.isChecked():
+            return
+
+        if self._first_image_path is None:
+            return
+
+        self._invalidate_pending_preview()
+
+        if self._source_preview_frame is not None:
+            self.preview_panel.set_frame(
+                self._source_preview_frame,
+                f"Original image · {self._first_image_path.name}",
+            )
+            self.preview_panel.set_status(
+                "Settings changed. Click Run a test to inspect the processing "
+                "stages with the current settings."
+            )
+        else:
+            self._queue_original_preview()
+            return
+
+        self._update_action_states()
+
+    @Slot()
+    def _reset_parameters(self) -> None:
+        """Restore defaults without launching an automatic test."""
+
+        self._invalidate_pending_preview()
+
+        controls = (
+            self.saturation_spin,
+            self.closing_spin,
+            self.opening_spin,
+            self.background_combo,
+        )
+
+        previous_states = [
+            control.blockSignals(True)
+            for control in controls
+        ]
+
+        try:
+            self.saturation_spin.setValue(
+                DEFAULT_SATURATION_THRESHOLD
+            )
+            self.closing_spin.setValue(
+                DEFAULT_CLOSING_RADIUS
+            )
+            self.opening_spin.setValue(
+                DEFAULT_OPENING_FACTOR
+            )
+            self.background_combo.setCurrentText(
+                DEFAULT_BACKGROUND_NAME
+            )
+        finally:
+            for control, previous_state in zip(
+                controls,
+                previous_states,
+            ):
+                control.blockSignals(previous_state)
+
+        if self.show_preview_checkbox.isChecked():
+            if self._first_image_path is not None:
+                if self._source_preview_frame is not None:
+                    self.preview_panel.set_frame(
+                        self._source_preview_frame,
+                        f"Original image · {self._first_image_path.name}",
+                    )
+                    self.preview_panel.set_status(
+                        "Default parameters restored. Click Run a test to "
+                        "inspect the processing stages."
+                    )
+                else:
+                    self._queue_original_preview()
+            else:
+                self.preview_panel.set_placeholder(
+                    "Defaults restored. Select an input folder to display its first image."
+                )
+                self.preview_panel.set_status(
+                    "Default parameters restored. No processing was started."
+                )
+        else:
+            self.preview_panel.set_status(
+                "Default parameters restored. Preview remains disabled."
+            )
+
+        self._update_action_states()
+
+    # -----------------------------------------------------------------
+    # Explicit preview/test request management
+    # -----------------------------------------------------------------
+
+    def _start_pending_preview(self) -> None:
+        """Start a requested preview when no older worker is active."""
+
+        if self._close_when_idle:
+            return
+
+        if not self.show_preview_checkbox.isChecked():
+            self._preview_pending_mode = None
+            self._update_action_states()
+            return
+
+        mode = self._preview_pending_mode
+
+        if mode is None:
+            return
+
+        if self._first_image_path is None:
+            self._preview_pending_mode = None
+            self._update_action_states()
+            return
+
+        if self._preview_worker is not None:
+            if self._preview_worker.isRunning():
+                self._preview_worker.request_cancel()
+            return
+
+        self._preview_pending_mode = None
+
+        self._start_preview_worker(
+            mode=mode,
+            request_id=self._preview_request_id,
+        )
+
+    def _start_preview_worker(
+        self,
+        *,
+        mode: str,
+        request_id: int,
+    ) -> None:
+        """Run a source-image display or test without saving outputs."""
+
+        if not self.show_preview_checkbox.isChecked():
+            self._update_action_states()
+            return
+
+        if self._first_image_path is None:
+            self.preview_panel.set_status(
+                "Please select an input folder first.",
+                "error",
+            )
+            self._update_action_states()
+            return
+
+        if self._preview_worker is not None:
+            return
+
+        worker = ClassicIIPreviewWorker(
+            request_id=request_id,
+            image_path=self._first_image_path,
+            saturation_threshold=self.saturation_spin.value(),
+            closing_radius=self.closing_spin.value(),
+            opening_factor=self.opening_spin.value(),
+            background_name=self.background_combo.currentText(),
+            test_mode=(mode == "test"),
+            original_only=(mode == "original"),
+        )
+
+        worker.stage_ready.connect(
+            self._on_preview_frame
+        )
+        worker.completed.connect(
+            self._on_preview_completed
+        )
+        worker.finished.connect(
+            lambda worker=worker:
+            self._on_preview_worker_finished(worker)
+        )
+
+        self._preview_worker = worker
+
+        if mode == "original":
+            self.preview_panel.set_status(
+                "Loading the original image. No detection is running.",
+                "working",
+            )
+        else:
+            self.preview_panel.set_status(
+                "Testing the first image with the actual detector. "
+                "No output files will be saved.",
+                "working",
+            )
+
+        self._update_action_states()
+        worker.start()
+
+    @Slot()
+    def _run_test(self) -> None:
+        """Test the first image using current settings; save no output files."""
+
+        if (
+            not self.show_preview_checkbox.isChecked()
+            or self._worker is not None
+        ):
+            return
+
+        if self._first_image_path is None:
+            self.preview_panel.set_status(
+                "Please select an input folder first.",
+                "error",
+            )
+            return
+
+        self._clear_test_stage_history()
+        self._preview_request_id += 1
+        self._preview_pending_mode = "test"
+
+        self.preview_panel.set_status(
+            "Testing the first image with the actual detector. "
+            "No output files will be saved.",
+            "working",
+        )
+
+        if self._preview_worker is not None:
+            if self._preview_worker.isRunning():
+                self._preview_worker.request_cancel()
+        else:
+            self._start_pending_preview()
+
+        self._update_action_states()
+
+    @Slot(int, str, object)
+    def _on_preview_frame(
+        self,
+        request_id: int,
+        stage_name: str,
+        frame: object,
+    ) -> None:
+        """Ignore frames belonging to superseded or disabled preview requests."""
+
+        if request_id != self._preview_request_id:
+            return
+
+        if not self.show_preview_checkbox.isChecked():
+            return
+
+        if stage_name.startswith("Original image"):
+            self._source_preview_frame = frame
+        elif (
+            self._preview_worker is not None
+            and self._preview_worker.request_id == request_id
+            and self._preview_worker.test_mode
+            and not self._preview_worker.original_only
+        ):
+            # Capture a detached frame for later manual review. The worker
+            # emits QImage objects; copy them so history is independent.
+            self._test_stage_history.append(
+                (stage_name, frame.copy())
+            )
+
+        self.preview_panel.set_frame(
+            frame,
+            stage_name,
+        )
+
+    def _show_test_stage(self, index: int) -> None:
+        """Display a stored stage from the most recently completed test."""
+
+        if not self._test_stage_history_ready:
+            return
+
+        if not (0 <= index < len(self._test_stage_history)):
+            return
+
+        if (
+            self._worker is not None
+            or self._preview_worker is not None
+            or self._preview_pending_mode is not None
+            or not self.show_preview_checkbox.isChecked()
+        ):
+            return
+
+        self._test_stage_index = index
+        stage_name, frame = self._test_stage_history[index]
+        self.preview_panel.set_frame(frame, stage_name)
+        self._update_action_states()
+
+    @Slot()
+    def _show_previous_test_stage(self) -> None:
+        """Move backward through the most recent test's saved stages."""
+
+        self._show_test_stage(self._test_stage_index - 1)
+
+    @Slot()
+    def _show_next_test_stage(self) -> None:
+        """Move forward through the most recent test's saved stages."""
+
+        self._show_test_stage(self._test_stage_index + 1)
+
+    @Slot(int, object)
+    def _on_preview_completed(
+        self,
+        request_id: int,
+        summary: object,
+    ) -> None:
+        """Report the test result without creating files."""
+
+        if request_id != self._preview_request_id:
+            return
+
+        if not self.show_preview_checkbox.isChecked():
+            return
+
+        result = dict(summary)
+
+        if result.get("cancelled"):
+            return
+
+        if result.get("original_only"):
+            if result.get("success") and self._first_image_path is not None:
+                self.preview_panel.set_status(
+                    f"Original image loaded: {self._first_image_path.name}. "
+                    "Click Run a test to inspect the actual processing stages. "
+                    "No output files were created."
+                )
+            elif result.get("error"):
+                self.preview_panel.set_placeholder(
+                    "The source image could not be displayed. Check that the "
+                    "file is readable and uses a supported image format."
+                )
+                self.preview_panel.set_status(
+                    f"Could not display the source image: {result['error']}",
+                    "error",
+                )
+            return
+
+        if result.get("test_mode"):
+            self._test_stage_history_ready = bool(
+                self._test_stage_history
+            )
+            self._test_stage_index = (
+                len(self._test_stage_history) - 1
+                if self._test_stage_history_ready
+                else -1
+            )
+
+        if result.get("success"):
+            left, top, right, bottom = result["bbox"]
+
+            self.preview_panel.set_status(
+                "Test complete: quadrat detected. "
+                f"Bounding box: left={left}, top={top}, "
+                f"width={right - left}, height={bottom - top}. "
+                "No output files were saved.",
+                "success",
+            )
+
+        else:
+            error = result.get("error") or (
+                "The detector did not return a valid quadrat mask."
+            )
+
+            self.preview_panel.set_status(
+                "Test complete: no valid quadrat was detected. "
+                f"{error} No output files were saved.",
+                "error",
+            )
+
+    def _on_preview_worker_finished(
+        self,
+        worker: ClassicIIPreviewWorker,
+    ) -> None:
+        """Release a finished worker and start a queued test if necessary."""
+
+        if self._preview_worker is not worker:
+            return
+
+        self._preview_worker = None
+
+        if self._close_when_idle:
+            QTimer.singleShot(0, self.close)
+            return
+
+        if self._preview_pending_mode is not None:
+            self._start_pending_preview()
+            return
+
+        self._update_action_states()
+
+    @Slot(str, object)
+    def _on_batch_preview_frame(
+        self,
+        stage_name: str,
+        frame: object,
+    ) -> None:
+        """Display actual intermediate frames from the batch worker."""
+
+        if self._worker is None:
+            return
+
+        if not self.show_preview_checkbox.isChecked():
+            return
+
+        self.preview_panel.set_frame(
+            frame,
+            stage_name,
+        )
+        self.preview_panel.set_status(
+            "Showing an actual intermediate processing stage. "
+            "The saved result is generated independently.",
+            "working",
+        )
+
+    def _update_action_states(self) -> None:
+        """Keep settings, test and batch actions consistent with worker state."""
+
+        batch_busy = self._worker is not None
+
+        preview_busy = (
+            self._preview_worker is not None
+            or self._preview_pending_mode is not None
+        )
+
+        for control in (
+            self.input_browse_button,
+            self.output_browse_button,
+            self.saturation_spin,
+            self.closing_spin,
+            self.opening_spin,
+            self.background_combo,
+            self.reset_button,
+        ):
+            control.setEnabled(
+                not batch_busy and not preview_busy
+            )
+
+        # Keep the checkbox operable during a preview test so rendering
+        # can be disabled immediately. The checkbox is outside the panel.
+        self.show_preview_checkbox.setEnabled(
+            not batch_busy
+        )
+
+        self.run_button.setEnabled(
+            not batch_busy and not preview_busy
+        )
+
+        self.preview_panel.test_button.setEnabled(
+            self.show_preview_checkbox.isChecked()
+            and not batch_busy
+            and not preview_busy
+            and self._first_image_path is not None
+        )
+
+        navigation_available = (
+            self._test_stage_history_ready
+            and bool(self._test_stage_history)
+            and self.show_preview_checkbox.isChecked()
+            and not batch_busy
+            and not preview_busy
+        )
+        self.preview_panel.set_stage_navigation_state(
+            previous_enabled=(
+                navigation_available
+                and self._test_stage_index > 0
+            ),
+            next_enabled=(
+                navigation_available
+                and self._test_stage_index
+                < len(self._test_stage_history) - 1
+            ),
+        )
+
+    # -----------------------------------------------------------------
+    # Messages and overwrite confirmation
     # -----------------------------------------------------------------
 
     def _message(
@@ -1340,10 +2390,10 @@ class AutoClassicIIDialog(QDialog):
         image_files: list[Path],
     ) -> OutputPolicy | None:
         """
-        Ask once for JPEG/MPO sessions.
+        Ask once for mixed/JPEG sessions when JPEG or MPO sources exist.
 
-        Other source formats use the central lossless policy. Returns None
-        if the user cancels the policy selection.
+        Other source formats remain under the central lossless policy.
+        Returns None if the user cancels.
         """
 
         has_jpeg_source = False
@@ -1352,7 +2402,7 @@ class AutoClassicIIDialog(QDialog):
             try:
                 source_metadata = inspect_image(image_path)
             except Exception:
-                # The worker will report inspection errors for this image.
+                # Malformed files are reported by the processing worker.
                 continue
 
             if source_metadata["format"] in {"JPEG", "MPO"}:
@@ -1374,7 +2424,7 @@ class AutoClassicIIDialog(QDialog):
             "the saved pixels.\n\n"
             "Keep JPEG: JPEG/MPO-derived outputs remain JPEG when supported. "
             "Source JPEG quantization tables and chroma sampling are reused "
-            "when safely available, but JPEG re-encoding remains lossy. "
+            "when safely available, but re-encoding remains lossy. "
             "Other source formats remain under the lossless policy."
         )
 
@@ -1382,13 +2432,11 @@ class AutoClassicIIDialog(QDialog):
             "Lossless output (recommended)",
             QMessageBox.ButtonRole.AcceptRole,
         )
-
         jpeg_button = box.addButton(
             "Keep JPEG (lossy re-encoding)",
             QMessageBox.ButtonRole.ActionRole,
         )
-
-        cancel_button = box.addButton(
+        box.addButton(
             "Cancel",
             QMessageBox.ButtonRole.RejectRole,
         )
@@ -1413,11 +2461,18 @@ class AutoClassicIIDialog(QDialog):
         return None
 
     # -----------------------------------------------------------------
-    # Start processing
+    # Start batch processing
     # -----------------------------------------------------------------
 
     @Slot()
     def _run_processing(self) -> None:
+        if (
+            self._worker is not None
+            or self._preview_worker is not None
+            or self._preview_pending_mode is not None
+        ):
+            return
+
         input_text = self.input_path_edit.text().strip()
         output_text = self.output_path_edit.text().strip()
 
@@ -1438,12 +2493,9 @@ class AutoClassicIIDialog(QDialog):
             return
 
         input_directory = Path(input_text).expanduser()
-        output_directory = Path(output_text).expanduser()
 
         try:
-            image_files = list_image_files(
-                input_directory
-            )
+            image_files = list_image_files(input_directory)
         except (OSError, ValueError) as exc:
             self._message(
                 QMessageBox.Icon.Critical,
@@ -1461,11 +2513,10 @@ class AutoClassicIIDialog(QDialog):
             )
             return
 
-        try:
-            resolved_input = input_directory.resolve()
-            resolved_output = output_directory.resolve()
+        output_directory = Path(output_text).expanduser()
 
-            if resolved_input == resolved_output:
+        try:
+            if input_directory.resolve() == output_directory.resolve():
                 self._message(
                     QMessageBox.Icon.Warning,
                     "Separate folders required",
@@ -1482,9 +2533,7 @@ class AutoClassicIIDialog(QDialog):
             )
             return
 
-        output_policy = self._choose_output_policy(
-            image_files
-        )
+        output_policy = self._choose_output_policy(image_files)
 
         if output_policy is None:
             return
@@ -1512,13 +2561,14 @@ class AutoClassicIIDialog(QDialog):
             )
             return
 
-        # Plan expected output paths before processing so that overwrite
-        # confirmation uses the central output policy and file extensions.
+        # Plan expected paths before processing, so the overwrite warning
+        # follows the extensions chosen by the central output policy.
         expected_outputs: list[Path] = []
 
         for image_path in image_files:
             try:
                 source_metadata = inspect_image(image_path)
+
                 orientation_normalized = (
                     _orientation_was_normalized(source_metadata)
                 )
@@ -1553,8 +2603,7 @@ class AutoClassicIIDialog(QDialog):
                 )
 
             except Exception:
-                # The worker will report an individual inspection/planning
-                # failure; no expected path is available for this image.
+                # The worker will report per-image inspection/planning errors.
                 continue
 
         unique_output_paths: dict[str, Path] = {}
@@ -1571,37 +2620,37 @@ class AutoClassicIIDialog(QDialog):
 
         if (
             existing_outputs
-            and not self._ask_overwrite(
-                len(existing_outputs)
-            )
+            and not self._ask_overwrite(len(existing_outputs))
         ):
             return
 
-        controls = (
-            self.input_browse_button,
-            self.output_browse_button,
-            self.saturation_spin,
-            self.closing_spin,
-            self.opening_spin,
-            self.background_combo,
-            self.run_button,
+        # Invalidate old preview results and test-stage navigation before
+        # starting a batch run. Batch preview frames are live-only.
+        self._clear_test_stage_history()
+        self._preview_pending_mode = None
+        self._preview_request_id += 1
+
+        preview_enabled = (
+            self.show_preview_checkbox.isChecked()
         )
-
-        for control in controls:
-            control.setEnabled(False)
-
-        self.cancel_button.setEnabled(True)
-        self.cancel_button.setText("Cancel processing")
 
         self.progress_bar.setRange(
             0,
             len(image_files),
         )
         self.progress_bar.setValue(0)
-
         self.progress_label.setText(
             f"Starting: {len(image_files)} image(s)…"
         )
+
+        self.progress_label.show()
+        self.progress_bar.show()
+
+        if preview_enabled:
+            self.preview_panel.set_status(
+                "Live processing display is enabled.",
+                "working",
+            )
 
         self._worker = ClassicIIWorker(
             image_files=image_files,
@@ -1612,24 +2661,30 @@ class AutoClassicIIDialog(QDialog):
             background_name=self.background_combo.currentText(),
             output_policy=output_policy,
             jpegtran=find_jpegtran(),
+            preview_enabled=preview_enabled,
         )
 
         self._worker.progress_changed.connect(
             self._on_progress
         )
-
+        self._worker.preview_frame.connect(
+            self._on_batch_preview_frame
+        )
         self._worker.completed.connect(
             self._on_completed
         )
-
         self._worker.finished.connect(
             self._on_worker_finished
         )
 
         self._worker.start()
 
+        self.cancel_button.setEnabled(True)
+        self.cancel_button.setText("Cancel processing")
+        self._update_action_states()
+
     # -----------------------------------------------------------------
-    # Progress and completion
+    # Batch progress and completion
     # -----------------------------------------------------------------
 
     @Slot(int, int, str)
@@ -1643,7 +2698,6 @@ class AutoClassicIIDialog(QDialog):
             0,
             max(1, total),
         )
-
         self.progress_bar.setValue(completed)
 
         self.progress_label.setText(
@@ -1657,21 +2711,8 @@ class AutoClassicIIDialog(QDialog):
     ) -> None:
         result = dict(summary)
 
-        controls = (
-            self.input_browse_button,
-            self.output_browse_button,
-            self.saturation_spin,
-            self.closing_spin,
-            self.opening_spin,
-            self.background_combo,
-            self.run_button,
-            self.cancel_button,
-        )
-
-        for control in controls:
-            control.setEnabled(True)
-
-        self.cancel_button.setText("Close")
+        self.progress_bar.hide()
+        self.progress_label.hide()
 
         if result["cancelled"]:
             status = "Processing was cancelled."
@@ -1687,11 +2728,6 @@ class AutoClassicIIDialog(QDialog):
             "Keep JPEG"
             if result.get("output_policy") == OutputPolicy.KEEP_JPEG.value
             else "Lossless"
-        )
-
-        self.progress_label.setText(
-            f"{status} {result['succeeded']} of "
-            f"{result['total']} image(s) processed successfully."
         )
 
         report = (
@@ -1750,8 +2786,16 @@ class AutoClassicIIDialog(QDialog):
 
     @Slot()
     def _on_worker_finished(self) -> None:
-        # The QThread has fully returned from run().
+        """Release the finished worker and restore UI controls."""
+
         self._worker = None
+        self.progress_bar.hide()
+        self.progress_label.hide()
+
+        self.cancel_button.setEnabled(True)
+        self.cancel_button.setText("Close")
+
+        self._update_action_states()
 
     # -----------------------------------------------------------------
     # Cancellation and closing
@@ -1768,19 +2812,48 @@ class AutoClassicIIDialog(QDialog):
             self.cancel_button.setText("Cancelling…")
 
             self.progress_label.setText(
-                "Cancellation requested; the current image will "
-                "finish first."
+                "Cancellation requested; the current image will finish first."
             )
             return
 
+        if (
+            self._preview_worker is not None
+            and self._preview_worker.isRunning()
+        ):
+            self._close_when_idle = True
+            self._preview_pending_mode = None
+            self._preview_worker.request_cancel()
+
+            self.cancel_button.setEnabled(False)
+            self.cancel_button.setText("Closing…")
+
+            self.preview_panel.set_status(
+                "Closing after the current preview operation stops…",
+                "working",
+            )
+            return
+
+        self._preview_pending_mode = None
         self.close()
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        self._preview_pending_mode = None
+
         if (
             self._worker is not None
             and self._worker.isRunning()
         ):
             self._worker.request_cancel()
             event.ignore()
-        else:
-            event.accept()
+            return
+
+        if (
+            self._preview_worker is not None
+            and self._preview_worker.isRunning()
+        ):
+            self._close_when_idle = True
+            self._preview_worker.request_cancel()
+            event.ignore()
+            return
+
+        event.accept()
