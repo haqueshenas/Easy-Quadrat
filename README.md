@@ -40,6 +40,12 @@ Easy Quadrat is nothing but the same quadrat traditionally used in agronomy and 
 
 In crop phenotyping, the entire image of an experimental plot is not always needed. Researchers may need to extract only one or more specific sampling regions, remove unwanted margins, or isolate a target area before performing subsequent image analysis.
 
+**White quadrats:** The three Auto methods are designed primarily
+for images containing a visible white sampling quadrat. They are
+not general-purpose detectors for quadrats of arbitrary colours.
+Detection quality depends on contrast, lighting, quadrat size,
+image resolution, and other image-acquisition conditions.
+
 Easy Quadrat provides five methods for defining and extracting these regions from plant images:
 
 1. **Manual** — draw a quadrat or polygon directly on an image.
@@ -104,7 +110,10 @@ The appropriate output depends on the objective of the subsequent analysis. Neit
 | **Auto · Classic II** | Similar tasks where directional morphological operations and convex-hull-based selection are useful. | Classical segmentation with horizontal and vertical directional processing. |
 | **Auto · Deep Learning** | Images suited to trained quadrat-detection and instance-segmentation models. | YOLO predicts quadrat instances and their masks. |
 
-The three Auto methods are designed to locate white sampling quadrats. Their performance depends on the image, quadrat appearance, lighting, scale, and other acquisition conditions. Automatic detections should be inspected rather than assumed to be correct.
+Automatic detection is sensitive to contrast, lighting, quadrat
+size, image resolution, and acquisition conditions. Inspect
+representative results rather than assuming every detected
+region is correct.
 
 ## 5. Method guide
 
@@ -239,6 +248,15 @@ Click **Run Classic II** to process the image collection. Successful detections 
 
 Auto · Deep Learning uses trained YOLO instance-segmentation models to detect quadrats and generate masks for accepted detections. The method offers four bundled models and supports compatible custom segmentation weights.
 
+**First-use note:** When you first use Auto · Deep Learning after
+installing the application, loading a built-in model may take
+noticeably longer than other steps, depending on your computer.
+The built-in model weights are included in the Windows package,
+so they are normally loaded from local files rather than downloaded
+from the internet. Please allow the model to finish loading before
+assuming that the application has stalled. Some loading time may
+recur when starting a separate test or batch run.
+
 #### Model options
 
 | Model | Description |
@@ -260,7 +278,12 @@ EQ1 and EQ2 are not guaranteed to behave identically on every dataset. Test the 
 | **Segmentation model** | EQ1 | Selects the built-in or custom model used for inference. |
 | **Custom model file** | None | Specifies the compatible custom `.pt` model when Custom model is selected. |
 | **Confidence threshold (0–1)** | 0.25 | Sets the minimum YOLO confidence threshold. Raising it makes acceptance stricter and may exclude valid quadrats; lowering it may accept less reliable detections. |
-| **Maximum quadrats per image** | 1 | Sets the maximum number of detected instances returned per image. It is an upper limit, not a guarantee that this many quadrats will be found. |
+| **Maximum quadrats per image** | 1 | Sets the maximum number of quadrat instances the model may return
+for each input image. The default is 1; set a value greater than 1
+when an image may contain multiple quadrats. This is an upper limit,
+not a guarantee that the model will detect that many quadrats.
+Actual detections depend on the model, image conditions, and
+confidence threshold. |
 | **Segmented background** | Black | Sets the background colour outside the union of the accepted detection masks. |
 | **Reset** | — | Restores the default model and detection parameters. |
 | **Show preview** | Enabled | Shows or hides the visual test panel. Disabling it does not disable batch processing. |
@@ -330,6 +353,40 @@ This is only an example. The researcher determines the appropriate sequence acco
 - Review warnings, errors, the selected output policy, and the processing log where available.
 - Check whether the extracted region corresponds to the intended sampling area and whether residual margins are acceptable for the planned analysis.
 - Use a fresh output directory for each run when you need to keep results separate and reproducible.
+
+### Sampling tolerance and parameter choice
+
+As in other areas of agricultural research, the appropriate
+sampling precision depends on the study design, research
+objectives, and the traits to be analysed. In large images
+containing millions of pixels, a small number of residual edge
+pixels or slight misalignment between a crop and the quadrat
+boundary may be negligible for some plot-level analyses. However,
+such errors may matter for small sampling areas, edge-sensitive
+measurements, or pixel-level analyses.
+
+There is no universally correct level of strictness for every
+dataset. Choose the method and its settings according to the
+research objective and image conditions. This may involve adjusting
+the confidence threshold in Deep Learning, the saturation and
+morphological parameters in the classical methods, the frame
+boundaries in Fixed Frame, or the selected polygon in Manual.
+Inspect representative outputs before applying a setting to an
+entire dataset, and document choices that could affect comparisons
+or conclusions.
+
+### Quadrat frame and surrounding margins
+
+Whether to retain visible parts of the white quadrat frame or surrounding margins depends on the objective of the subsequent analysis. The quadrat is a spatial reference, not vegetation. If its white-frame pixels are included in calculations of canopy cover, mean RGB values, greenness indices, or other pixel-based traits, they may affect the results and interfere with plant–background classification.
+
+Likewise, pixels outside the intended sampling area may include soil, neighbouring plants, or other objects. Retaining or excluding these margins can therefore change the sampled area and the resulting statistics.
+
+For analyses intended to characterize vegetation within the quadrat, exclude or mask frame pixels and out-of-quadrat margins from downstream calculations where appropriate. For other purposes, retaining some of this context may be useful for visual inspection, quality control, or a different analytical objective. The choice should be guided by the research question and applied consistently across comparable images.
+
+Easy Quadrat defines and extracts quadrat-based image regions; it does not perform a separate, plant-only segmentation that guarantees removal of every frame pixel or every unwanted object within the selected or detected region. Inspect the outputs and determine whether further masking or processing is needed for the intended analysis.
+
+Finally, ordinary RGB pixel values should not be interpreted as calibrated surface reflectance unless appropriate image-acquisition and calibration procedures have been applied.
+
 
 The supported input formats depend on the selected method and the image formats available to its reader and writer components. Common formats include JPEG, PNG, TIFF, BMP and WebP; certain methods also handle MPO and GIF images.
 
