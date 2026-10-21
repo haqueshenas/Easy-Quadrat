@@ -8,7 +8,7 @@
 
 Version 2.0.0 · Free and open-source crop-phenotyping software
 
-[Download Windows application](https://github.com/haqueshenas/Easy-Quadrat/releases/latest) · [Source code](https://github.com/haqueshenas/Easy-Quadrat) · [Easy-Phenotyping Lab (EPL)](https://haqueshenas.github.io/EPL/)
+[Download Windows application (v2.0.0)](https://github.com/haqueshenas/Easy-Quadrat/releases/tag/v2.0.0) · [Source code (v2.0.0)](https://github.com/haqueshenas/Easy-Quadrat/tree/v2.0.0) · [Easy-Phenotyping Lab (EPL)](https://haqueshenas.github.io/EPL/)
 
 *Select, crop, and segment quadrat-based sampling regions in crop images—with manual control, classical image processing, or deep learning.*
 
@@ -370,5 +370,16 @@ Before using or redistributing the relevant components, read [`THIRD_PARTY_NOTIC
 
 For questions, reproducible bug reports, or suggestions, please use the repository's [GitHub Issues](https://github.com/haqueshenas/Easy-Quadrat/issues) page.
 
-Copyright © 2026 Abbas Haghshenas.
+---
 
+<div align="center">
+
+**Easy Quadrat · Version 2.0.0**
+
+Quadrat-based sampling for image-based crop phenotyping
+
+[Easy-Phenotyping Lab (EPL)](https://haqueshenas.github.io/EPL/)
+
+Copyright © 2026 Abbas Haghshenas · MIT License for the Easy Quadrat application source
+
+</div>
