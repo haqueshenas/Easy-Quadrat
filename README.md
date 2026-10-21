@@ -278,12 +278,7 @@ EQ1 and EQ2 are not guaranteed to behave identically on every dataset. Test the 
 | **Segmentation model** | EQ1 | Selects the built-in or custom model used for inference. |
 | **Custom model file** | None | Specifies the compatible custom `.pt` model when Custom model is selected. |
 | **Confidence threshold (0–1)** | 0.25 | Sets the minimum YOLO confidence threshold. Raising it makes acceptance stricter and may exclude valid quadrats; lowering it may accept less reliable detections. |
-| **Maximum quadrats per image** | 1 | Sets the maximum number of quadrat instances the model may return
-for each input image. The default is 1; set a value greater than 1
-when an image may contain multiple quadrats. This is an upper limit,
-not a guarantee that the model will detect that many quadrats.
-Actual detections depend on the model, image conditions, and
-confidence threshold. |
+| **Maximum quadrats per image** | 1 | Sets the maximum number of quadrat instances the model may return for each input image. The default is 1; set a value greater than 1 when an image may contain multiple quadrats. This is an upper limit, not a guarantee that the model will detect that many quadrats. Actual detections depend on the model, image conditions, and confidence threshold. |
 | **Segmented background** | Black | Sets the background colour outside the union of the accepted detection masks. |
 | **Reset** | — | Restores the default model and detection parameters. |
 | **Show preview** | Enabled | Shows or hides the visual test panel. Disabling it does not disable batch processing. |
