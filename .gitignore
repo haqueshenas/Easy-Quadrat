@@ -1,0 +1,23 @@
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local development environments
+.venv/
+venv/
+
+# PyCharm local settings
+.idea/
+
+# PyInstaller build output
+build/
+dist/
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.bak
+dist/

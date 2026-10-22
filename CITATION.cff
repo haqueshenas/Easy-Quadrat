@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use Easy Quadrat, please cite it using the metadata below."
+title: "Easy Quadrat"
+type: software
+version: "2.0.0"
+abstract: >-
+  Easy Quadrat is a desktop application for defining, cropping, and segmenting
+  quadrat-based sampling regions in crop images using manual selection,
+  proportional fixed-frame cropping, classical image processing, and YOLO-based
+  instance segmentation. The Easy Quadrat application source is distributed
+  under the MIT License. YOLO-related components and trained model weights are
+  subject to separate third-party licensing terms described in the repository.
+authors:
+  - family-names: Haghshenas
+    given-names: Abbas
+keywords:
+  - crop phenotyping
+  - plant phenotyping
+  - quadrat sampling
+  - image processing
+  - image segmentation
+repository-code: "https://github.com/haqueshenas/Easy-Quadrat"
+url: "https://github.com/haqueshenas/Easy-Quadrat"
+license: MIT
