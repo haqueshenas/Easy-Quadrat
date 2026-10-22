@@ -21,4 +21,8 @@ keywords:
   - image segmentation
 repository-code: "https://github.com/haqueshenas/Easy-Quadrat"
 url: "https://github.com/haqueshenas/Easy-Quadrat"
+identifiers:
+  - description: "DOI provided by Zenodo for Easy Quadrat."
+    type: doi
+    value: "10.5281/zenodo.23557475"
 license: MIT
